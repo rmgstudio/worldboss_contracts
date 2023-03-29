@@ -4,11 +4,13 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
-import "./Pauseable.sol";
+import "./BulletPauseable.sol";
 import "./Constant.sol";
-import "./Checker.sol";
 
-abstract contract Bullet is ReentrancyGuardUpgradeable, Pauseable, Checker {
+abstract contract Bullet is
+    ReentrancyGuardUpgradeable,
+    BulletPauseable
+{
     struct WithdrawForm {
         uint256 amount;
         uint256 time;
@@ -27,7 +29,6 @@ abstract contract Bullet is ReentrancyGuardUpgradeable, Pauseable, Checker {
     mapping(address => WithdrawForm) public withdraw_form;
     address public token;
     uint256 public fee;
-    uint256 public user_total_bullet;
     uint256 private _system_bullet;
     address public system_wallet;
     address public fee_wallet;
@@ -92,13 +93,12 @@ abstract contract Bullet is ReentrancyGuardUpgradeable, Pauseable, Checker {
         require(to.code.length == 0, "topup to EOA only");
         _topup_block[to] = block.number;
         _addBullet(to, amount);
-
         emit Topup(to, amount);
     }
 
     function _beforeWithdraw() internal virtual {}
 
-    function preWithdraw(uint256 amount) external whenNotPaused {
+    function preWithdraw(uint256 amount) external whenBulletNotPaused {
         require(withdraw_form[msg.sender].amount == 0, "withdraw pls");
         _beforeWithdraw();
         _reduceBullet(msg.sender, amount);
@@ -108,15 +108,11 @@ abstract contract Bullet is ReentrancyGuardUpgradeable, Pauseable, Checker {
     }
 
     function withdrawTimeOf(address user) public view returns (uint256) {
-        if (isPausing) return type(uint256).max;
-        uint256 cd = withdraw_cd;
-        if (withdraw_form[user].time <= pauseTime) {
-            cd += _pauseDuration;
-        }
-        return withdraw_form[user].time + cd;
+        if (isBulletPausing) return type(uint256).max;
+        return withdraw_form[user].time + withdraw_cd;
     }
 
-    function withdraw() external nonReentrant whenNotPaused {
+    function withdraw() external nonReentrant whenBulletNotPaused {
         require(withdraw_form[msg.sender].amount > 0, "preWithdraw need");
         require(withdrawTimeOf(msg.sender) <= block.timestamp);
         uint256 amount = withdraw_form[msg.sender].amount;
@@ -149,15 +145,12 @@ abstract contract Bullet is ReentrancyGuardUpgradeable, Pauseable, Checker {
 
     function _addBullet(address user, uint256 amount) internal {
         _bullet_balance[user] += amount;
-        user_total_bullet += amount;
     }
 
     function _reduceBullet(address user, uint256 amount) internal {
         require(_topup_block[msg.sender] < block.number, "Error: same block");
         require(_bullet_balance[user] >= amount, "insufficient bullet_amount");
         _bullet_balance[user] -= amount;
-        require(user_total_bullet >= amount);
-        user_total_bullet -= amount;
     }
 
     function bulletOf(address user) public view returns (uint256) {

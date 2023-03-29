@@ -1,75 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 pragma solidity ^0.8.0;
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts/utils/Multicall.sol";
 import "@chainlink/contracts/src/v0.8/AutomationCompatible.sol";
-import "./Pauseable.sol";
-import "./MultiStaticCall.sol";
+import "./IGame.sol";
 import "./Bullet.sol";
-import "./Checker.sol";
-import "./Whitelist.sol";
+import "./GamePauseable.sol";
 
-contract WorldBossGame is
-    ReentrancyGuardUpgradeable,
-    Multicall,
-    MultiStaticCall,
-    Pauseable,
-    Checker,
-    Whitelist,
-    Bullet,
-    AutomationCompatible
-{
-    struct Config {
-        uint256 base_hp;
-        uint256 hp_scale_numerator;
-        uint256 hp_scale_denominator;
-        uint256 lock_lv;
-        uint256 lock_percent;
-        uint256 lv_reward_percent;
-        uint256 prize_percent;
-        uint256 attack_cd;
-        uint256 escape_cd;
-    }
-
-    struct Boss {
-        uint256 hp;
-        uint256 born_time;
-        uint256 attack_time;
-        uint256 escape_time;
-    }
-
-    struct Level {
-        uint256 hp;
-        uint256 total_bullet;
-        mapping(address => uint256) user_bullet;
-        mapping(address => uint256) user_bullet_recycled;
-        mapping(address => uint256) user_kill_reward_claimed;
-    }
-
-    struct Round {
-        uint256 lv;
-        uint256 prize;
-        Config config;
-        uint256[] prize_config;
-        address[] prize_users;
-        mapping(address => uint256) prize_claimed;
-        mapping(uint256 => Level) levels;
-    }
-
-    struct RoundLevel {
-        uint256 roundId;
-        uint256 lv;
-    }
-
-    struct LevelDetail {
-        uint256 total_bullet;
-        uint256 user_bullet;
-        uint256 user_damage;
-        uint256 recycled_bullet;
-        uint256 kill_reward;
-    }
-
+contract WorldBossGame is Bullet, GamePauseable, AutomationCompatible, IGame {
     event NewBoss(
         uint256 roundId,
         uint256 lv,
@@ -90,14 +27,17 @@ contract WorldBossGame is
     event IncreasePrize(uint256 roundId, address user, uint256 amount);
 
     uint256 public roundId;
-    Config public global_config;
-    uint256[] public global_prize_config;
+    Config private global_config;
+    uint32[] private global_prize_config;
+    uint64 public born_cd_pre_attack;
+    uint64 public born_cd_attack;
     Boss public boss;
     mapping(uint256 => Round) public rounds;
-    mapping(address => RoundLevel) public recycleRoundLevel;
-    mapping(address => RoundLevel) public prizeRoundLevel;
-    mapping(address => RoundLevel[]) public killRewardRoundLevels;
-    mapping(address => mapping(uint256 => uint256[])) public attacked_lvs;
+    mapping(uint256 => mapping(uint256 => Level)) private levels;
+    mapping(address => RoundLevel) private userPreRoundLevel;
+    mapping(address => RoundLevel[]) private killRewardRoundLevels;
+    /**       user              roundId     levels */
+    mapping(address => mapping(uint256 => uint256[])) private attacked_lvs;
 
     constructor() {
         _disableInitializers();
@@ -113,23 +53,25 @@ contract WorldBossGame is
     ) public initializer {
         _initOwnable(owner_, admin_);
         _initBullet(token_, system_wallet_, fee_wallet_, fee_);
+        born_cd_pre_attack = 300;
+        born_cd_attack = 1800;
+        global_config = Config(3000000000000000000000, 10900, 3, 4000, 800, 100, 300, 21300);
+        global_prize_config = [800, 800, 800, 2500, 5100];
     }
 
     function setConfig(
         uint256 base_hp_,
-        uint256 hp_scale_numerator,
-        uint256 hp_scale_denominator,
-        uint256 lock_lv_,
-        uint256 lock_percent_,
-        uint256 lv_reward_percent_,
-        uint256 prize_percent_,
-        uint256 attack_cd,
-        uint256 escape_cd,
-        uint256[] memory prize_config_
+        uint32 hp_scale,
+        uint32 lock_lv_,
+        uint32 lock_percent_,
+        uint32 lv_reward_percent_,
+        uint32 prize_percent_,
+        uint32 attack_cd,
+        uint32 escape_cd,
+        uint32[] memory prize_config_
     ) external onlyOwner {
         require(base_hp_ > 0);
-        require(hp_scale_numerator > 0);
-        require(hp_scale_denominator > 0);
+        require(hp_scale > 0);
         require(lock_lv_ > 0);
         require(lock_percent_ > 0 && lock_percent_ < Constant.E4);
         require(lv_reward_percent_ > 0 && lv_reward_percent_ < Constant.E4);
@@ -138,8 +80,7 @@ contract WorldBossGame is
         require(escape_cd > 0);
         global_config = Config(
             base_hp_,
-            hp_scale_numerator,
-            hp_scale_denominator,
+            hp_scale,
             lock_lv_,
             lock_percent_,
             lv_reward_percent_,
@@ -159,8 +100,7 @@ contract WorldBossGame is
         Round storage round = rounds[roundId];
         require(round.config.base_hp == 0);
         round.config.base_hp = global_config.base_hp;
-        round.config.hp_scale_numerator = global_config.hp_scale_numerator;
-        round.config.hp_scale_denominator = global_config.hp_scale_denominator;
+        round.config.hp_scale = global_config.hp_scale;
         round.config.lock_lv = global_config.lock_lv;
         round.config.lock_percent = global_config.lock_percent;
         round.config.lv_reward_percent = global_config.lv_reward_percent;
@@ -171,7 +111,7 @@ contract WorldBossGame is
         round.prize_config = global_prize_config;
     }
 
-    function startGame() external onlyAdmin whenNotPaused {
+    function startGame() external onlyAdmin whenGameNotPaused {
         require(global_config.base_hp > 0);
         roundId = 1;
         rounds[roundId].lv = 1;
@@ -180,22 +120,37 @@ contract WorldBossGame is
     }
 
     function _increaseHp() internal view returns (uint256 _hp) {
-        Config storage _round_config = _roundConfigOf(roundId);
+        Config storage _round_config = rounds[roundId].config;
         if (rounds[roundId].lv == 1) {
             _hp = _round_config.base_hp;
         } else {
-            _hp = (boss.hp * _round_config.hp_scale_numerator) / _round_config.hp_scale_denominator;
+            _hp = (boss.hp * _round_config.hp_scale) / Constant.E4;
         }
     }
 
     function _bornBoss() internal {
-        Config storage _round_config = _roundConfigOf(roundId);
+        Config storage _round_config = rounds[roundId].config;
         uint256 _hp = _increaseHp();
-        uint256 _born_time = block.timestamp + Constant.CD - (block.timestamp % Constant.CD);
+        uint256 _born_time;
+
+        if (rounds[roundId].lv > 1) {
+            Level storage pre_lv = levels[roundId][rounds[roundId].lv - 1];
+            if (pre_lv.total_bullet > pre_lv.hp) {
+                _born_time =
+                    block.timestamp +
+                    born_cd_pre_attack -
+                    (block.timestamp % born_cd_pre_attack);
+            } else {
+                _born_time = block.timestamp + born_cd_attack - (block.timestamp % born_cd_attack);
+            }
+        } else {
+            _born_time = block.timestamp + born_cd_attack - (block.timestamp % born_cd_attack);
+        }
+
         uint256 _attack_time = _born_time + _round_config.attack_cd;
         uint256 _escape_time = _attack_time + _round_config.escape_cd;
-        boss = Boss(_hp, _born_time, _attack_time, _escape_time);
-        rounds[roundId].levels[rounds[roundId].lv].hp = _hp;
+        boss = Boss(_hp, uint64(_born_time), uint64(_attack_time), uint64(_escape_time));
+        levels[roundId][rounds[roundId].lv].hp = _hp;
         emit NewBoss(
             roundId,
             rounds[roundId].lv,
@@ -207,7 +162,7 @@ contract WorldBossGame is
     }
 
     function _frozenLevelReward(uint256 roundId_) internal {
-        Config storage _round_config = _roundConfigOf(roundId_);
+        Config storage _round_config = rounds[roundId_].config;
         uint256 _lv_reward = (boss.hp * _round_config.lv_reward_percent) / Constant.E4;
         _addFrozenBullet(_lv_reward);
     }
@@ -215,9 +170,8 @@ contract WorldBossGame is
     function preAttack(
         uint256 roundId_,
         uint256 lv_,
-        uint256 bullet_amount_,
-        MerkleParam calldata merkleParam
-    ) external nonReentrant whenNotPaused onlyEOA onlyWhitlist(merkleParam) {
+        uint256 bullet_amount_
+    ) external whenGameNotPaused {
         require(roundId == roundId_, "invalid roundId_");
         require(rounds[roundId].lv == lv_, "invalid lv_");
         require(block.timestamp > boss.born_time, "boss isn't born yet");
@@ -225,8 +179,8 @@ contract WorldBossGame is
         _autoClaim();
         _pushRoundLevel();
         _reduceBullet(msg.sender, bullet_amount_);
-        Level storage level = rounds[roundId].levels[lv_];
-        level.user_bullet[msg.sender] += bullet_amount_;
+        Level storage level = levels[roundId_][lv_];
+        level.user_bullet[msg.sender].attacked += bullet_amount_;
         level.total_bullet += bullet_amount_;
         _updatePrizeUser(bullet_amount_);
         emit PreAttack(msg.sender, roundId_, lv_, bullet_amount_);
@@ -235,14 +189,13 @@ contract WorldBossGame is
     function attack(
         uint256 roundId_,
         uint256 lv_,
-        uint256 bullet_amount_,
-        MerkleParam calldata merkleParam
-    ) external nonReentrant whenNotPaused onlyEOA onlyWhitlist(merkleParam) {
+        uint256 bullet_amount_
+    ) external whenGameNotPaused {
         require(roundId == roundId_, "invalid roundId_");
         require(rounds[roundId].lv == lv_, "invalid lv_");
         require(block.timestamp > boss.attack_time, "invalid time");
-        require(block.timestamp <= _bossEscapeTime(), "boss escaped");
-        Level storage level = rounds[roundId].levels[rounds[roundId].lv];
+        require(block.timestamp <= boss.escape_time, "boss escaped");
+        Level storage level = levels[roundId_][lv_];
         require(boss.hp > level.total_bullet, "boss was dead");
 
         if (bullet_amount_ > boss.hp - level.total_bullet) {
@@ -251,13 +204,13 @@ contract WorldBossGame is
         _attack(bullet_amount_);
     }
 
-    function decideEscapedOrDead() public nonReentrant whenNotPaused {
-        Level storage level = rounds[roundId].levels[rounds[roundId].lv];
+    function decideEscapedOrDead() public whenGameNotPaused {
+        Level storage level = levels[roundId][rounds[roundId].lv];
         if (boss.hp <= level.total_bullet) {
             require(block.timestamp > boss.attack_time, "invalid time");
             _dead();
         } else {
-            require(block.timestamp > _bossEscapeTime(), "invalid time");
+            require(block.timestamp > boss.escape_time, "invalid time");
             _escape();
         }
     }
@@ -268,11 +221,12 @@ contract WorldBossGame is
         performData = bytes("");
 
         if (!isPausing && roundId > 0) {
-            Level storage level = rounds[roundId].levels[rounds[roundId].lv];
+            Level storage level = levels[roundId][rounds[roundId].lv];
             if (boss.hp <= level.total_bullet) {
+                // boss dead
                 upkeepNeeded = block.timestamp > boss.attack_time;
             } else {
-                upkeepNeeded = block.timestamp > _bossEscapeTime();
+                upkeepNeeded = block.timestamp > boss.escape_time;
             }
         }
     }
@@ -289,7 +243,7 @@ contract WorldBossGame is
             roundId,
             rounds[roundId].lv,
             boss.hp,
-            rounds[roundId].levels[rounds[roundId].lv].total_bullet
+            levels[roundId][rounds[roundId].lv].total_bullet
         );
         _frozenLevelReward(roundId);
         _frozenPrizeReward(roundId);
@@ -300,8 +254,8 @@ contract WorldBossGame is
      * on boss escaped
      */
     function _escape() internal {
-        require(block.timestamp > _bossEscapeTime());
-        Level storage level = rounds[roundId].levels[rounds[roundId].lv];
+        require(block.timestamp > boss.escape_time);
+        Level storage level = levels[roundId][rounds[roundId].lv];
         require(boss.hp > level.total_bullet);
         _unfrozenLevelRewardAndClaimBulletToSystem();
         emit Escaped(roundId, rounds[roundId].lv, boss.hp, level.total_bullet);
@@ -313,8 +267,8 @@ contract WorldBossGame is
         _autoClaim();
         _pushRoundLevel();
         _reduceBullet(msg.sender, bullet_amount_);
-        Level storage level = rounds[roundId].levels[rounds[roundId].lv];
-        level.user_bullet[msg.sender] += bullet_amount_;
+        Level storage level = levels[roundId][rounds[roundId].lv];
+        level.user_bullet[msg.sender].attacked += bullet_amount_;
         level.total_bullet += bullet_amount_;
         _updatePrizeUser(bullet_amount_);
         emit Attack(msg.sender, roundId, rounds[roundId].lv, bullet_amount_);
@@ -324,14 +278,14 @@ contract WorldBossGame is
     }
 
     function _pushRoundLevel() internal {
-        if (rounds[roundId].levels[rounds[roundId].lv].user_bullet[msg.sender] > 0) return;
+        if (levels[roundId][rounds[roundId].lv].user_bullet[msg.sender].attacked > 0) return;
         attacked_lvs[msg.sender][roundId].push(rounds[roundId].lv);
-        recycleRoundLevel[msg.sender] = RoundLevel(roundId, rounds[roundId].lv);
-        prizeRoundLevel[msg.sender] = RoundLevel(roundId, rounds[roundId].lv);
+        userPreRoundLevel[msg.sender].roundId = roundId;
+        userPreRoundLevel[msg.sender].lv = rounds[roundId].lv;
         killRewardRoundLevels[msg.sender].push(RoundLevel(roundId, rounds[roundId].lv));
     }
 
-    function autoClaim() external nonReentrant whenNotPaused onlyEOA {
+    function autoClaim() external whenGameNotPaused {
         _autoClaim();
     }
 
@@ -356,40 +310,8 @@ contract WorldBossGame is
         }
     }
 
-    function claimableRewardOf(address user) public view returns (uint256 total_reward) {
-        total_reward = 0;
-        if (canRecycleLevelBullet(user)) {
-            (, , uint256 recycled_total, ) = levelBulletOf(
-                recycleRoundLevel[user].roundId,
-                recycleRoundLevel[user].lv,
-                user
-            );
-            total_reward += recycled_total;
-        }
-
-        if (canClaimPrizeReward(user)) {
-            uint256 prize_reward = userPrizeRewardOf(prizeRoundLevel[user].roundId, user);
-            total_reward += prize_reward;
-        }
-
-        RoundLevel[] storage _lvs = killRewardRoundLevels[user];
-        for (uint i = 0; i < _lvs.length; i++) {
-            if (canClaimKillReward(_lvs[i].roundId, _lvs[i].lv, user)) {
-                uint256 kill_reward = killRewardOf(_lvs[i].roundId, _lvs[i].lv, user);
-                total_reward += kill_reward;
-            }
-        }
-    }
-
-    function bulletAndClaimableOf(
-        address user
-    ) public view returns (uint256 bullet_, uint256 claimable_) {
-        bullet_ = bulletOf(user);
-        claimable_ = claimableRewardOf(user);
-    }
-
     function _frozenPrizeReward(uint256 roundId_) internal {
-        Config storage _round_config = _roundConfigOf(roundId_);
+        Config storage _round_config = rounds[roundId_].config;
         uint256 _add_prize = (boss.hp * _round_config.prize_percent) / Constant.E4;
         rounds[roundId].prize += _add_prize;
         _addFrozenBullet(_add_prize);
@@ -401,21 +323,13 @@ contract WorldBossGame is
         _bornBoss();
     }
 
-    //--------------------------------------------------
-
-    function recycleLevelBullet() public nonReentrant whenNotPaused onlyEOA {
-        require(canRecycleLevelBullet(msg.sender), "Error");
-        _recycleLevelBullet();
-    }
-
     function canRecycleLevelBullet(address user) public view returns (bool) {
-        // if (recycleRoundLevel[user].roundId == 0 || recycleRoundLevel[user].lv == 0) return false;
-        uint256 roundId_ = recycleRoundLevel[user].roundId;
-        uint256 lv_ = recycleRoundLevel[user].lv;
+        uint256 roundId_ = userPreRoundLevel[user].roundId;
+        uint256 lv_ = userPreRoundLevel[user].lv;
         if (rounds[roundId_].lv == lv_) return false;
-        Level storage level = rounds[roundId_].levels[lv_];
-        if (level.user_bullet[user] == 0) return false;
-        if (level.user_bullet_recycled[user] > 0) return false;
+        Level storage level = levels[roundId_][lv_];
+        if (level.user_bullet[user].attacked == 0) return false;
+        if (level.user_bullet[user].recycled) return false;
         return true;
     }
 
@@ -433,12 +347,11 @@ contract WorldBossGame is
             uint256 user_bullet
         )
     {
-        Level storage level = rounds[roundId_].levels[lv_];
-        Config storage _round_config = _roundConfigOf(roundId_);
-        uint256 _hp = _bossHpOf(roundId_, lv_);
-        user_bullet = level.user_bullet[user_];
-        if (level.total_bullet >= _hp) {
-            uint256 _damage = (_hp * user_bullet) / level.total_bullet;
+        Level storage level = levels[roundId_][lv_];
+        Config storage _round_config = rounds[roundId_].config;
+        user_bullet = level.user_bullet[user_].attacked;
+        if (level.total_bullet >= level.hp) {
+            uint256 _damage = (level.hp * user_bullet) / level.total_bullet;
             if (user_bullet > _damage) unused_bullet = user_bullet - _damage;
             recycled_bullet = (_damage * (Constant.E4 - _round_config.lock_percent)) / Constant.E4;
             recycled_total = unused_bullet + recycled_bullet;
@@ -446,23 +359,13 @@ contract WorldBossGame is
     }
 
     function _recycleLevelBullet() internal {
-        uint256 roundId_ = recycleRoundLevel[msg.sender].roundId;
-        uint256 lv_ = recycleRoundLevel[msg.sender].lv;
-        Level storage level = rounds[roundId_].levels[lv_];
+        uint256 roundId_ = userPreRoundLevel[msg.sender].roundId;
+        uint256 lv_ = userPreRoundLevel[msg.sender].lv;
+        Level storage level = levels[roundId_][lv_];
         (, , uint256 total, ) = levelBulletOf(roundId_, lv_, msg.sender);
-        level.user_bullet_recycled[msg.sender] = total;
+        level.user_bullet[msg.sender].recycled = true;
         _addBullet(msg.sender, total);
         emit RecycleLevelBullet(msg.sender, roundId_, lv_, total);
-    }
-
-    //--------------------------------------------------
-
-    function claimKillReward(
-        uint256 roundId_,
-        uint256 lv_
-    ) public nonReentrant whenNotPaused onlyEOA {
-        require(canClaimKillReward(roundId_, lv_, msg.sender), "Error");
-        _claimKillReward(roundId_, lv_);
     }
 
     function canClaimKillReward(
@@ -470,11 +373,11 @@ contract WorldBossGame is
         uint256 lv_,
         address user
     ) public view returns (bool) {
-        Config storage _round_config = _roundConfigOf(roundId_);
+        Config storage _round_config = rounds[roundId_].config;
         if (rounds[roundId_].lv <= lv_ + _round_config.lock_lv) return false;
-        Level storage level = rounds[roundId_].levels[lv_];
-        if (level.user_bullet[user] == 0) return false;
-        if (level.user_kill_reward_claimed[user] > 0) return false;
+        Level storage level = levels[roundId_][lv_];
+        if (level.user_bullet[user].attacked == 0) return false;
+        if (level.user_bullet[user].kill_reward_claimed) return false;
         return true;
     }
 
@@ -483,22 +386,21 @@ contract WorldBossGame is
         uint256 lv_,
         address user_
     ) public view returns (uint256 total_reward) {
-        Config storage _round_config = _roundConfigOf(roundId_);
+        Config storage _round_config = rounds[roundId_].config;
         require(rounds[roundId_].lv > lv_ + _round_config.lock_lv);
-        Level storage level = rounds[roundId_].levels[lv_];
-        require(level.user_bullet[user_] > 0, "0 bullet");
-        require(level.user_kill_reward_claimed[user_] == 0, "claimed already");
-        uint256 _boss_hp = _bossHpOf(roundId_, lv_);
-        uint256 _damage = (_boss_hp * level.user_bullet[user_]) / level.total_bullet;
-        total_reward =
-            (_damage * (_round_config.lock_percent + _round_config.lv_reward_percent)) /
-            Constant.E4;
+        if (rounds[roundId_].lv > lv_ + _round_config.lock_lv) {
+            Level storage level = levels[roundId_][lv_];
+            uint256 _damage = (level.hp * level.user_bullet[user_].attacked) / level.total_bullet;
+            total_reward =
+                (_damage * (_round_config.lock_percent + _round_config.lv_reward_percent)) /
+                Constant.E4;
+        }
     }
 
     function _claimKillReward(uint256 roundId_, uint256 lv_) internal {
         uint256 total_reward = killRewardOf(roundId_, lv_, msg.sender);
-        Level storage level = rounds[roundId_].levels[lv_];
-        level.user_kill_reward_claimed[msg.sender] = total_reward;
+        Level storage level = levels[roundId_][lv_];
+        level.user_bullet[msg.sender].kill_reward_claimed = true;
         _addBullet(msg.sender, total_reward);
         emit ClaimKillReward(msg.sender, roundId_, lv_, total_reward);
         _removeFromKillRewardRoundLevel(roundId_, lv_);
@@ -520,90 +422,12 @@ contract WorldBossGame is
         }
     }
 
-    function levelInfoOf(
-        uint256 roundId_,
-        uint256 lv_
-    ) public view returns (uint256 boss_hp, uint256 _total_bullet) {
-        Level storage level = rounds[roundId_].levels[lv_];
-        boss_hp = level.hp;
-        _total_bullet = level.total_bullet;
-    }
-
-    function levelDetailOf(
-        uint256 roundId_,
-        uint256 lv_,
-        address user_
-    ) public view returns (LevelDetail memory detail) {
-        uint256 recycled_bullet;
-        uint256 unused_bullet;
-        uint256 recycled_total;
-        uint256 user_bullet;
-        if (roundId_ > roundId || lv_ > rounds[roundId_].lv) {
-            detail = LevelDetail(0, 0, 0, 0, 0);
-        } else {
-            Level storage level = rounds[roundId_].levels[lv_];
-            Config storage _round_config = _roundConfigOf(roundId_);
-            uint256 _hp = _bossHpOf(roundId_, lv_);
-            user_bullet = level.user_bullet[user_];
-            if (_hp <= level.total_bullet) {
-                uint256 _damage = (_hp * user_bullet) / level.total_bullet;
-                if (user_bullet > _damage) unused_bullet = user_bullet - _damage;
-                recycled_bullet =
-                    (_damage * (Constant.E4 - _round_config.lock_percent)) /
-                    Constant.E4;
-                recycled_total = unused_bullet + recycled_bullet;
-                uint256 kill_reward = (_damage *
-                    (_round_config.lock_percent + _round_config.lv_reward_percent)) / Constant.E4;
-
-                detail = LevelDetail(
-                    level.total_bullet,
-                    user_bullet,
-                    _damage,
-                    recycled_total,
-                    kill_reward
-                );
-            } else {
-                detail = LevelDetail(level.total_bullet, user_bullet, 0, 0, 0);
-            }
-        }
-    }
-
-    function levelDetailListOf(
-        uint256 roundId_,
-        address user
-    ) public view returns (uint256[] memory lvs, LevelDetail[] memory list) {
-        lvs = attacked_lvs[user][roundId_];
-        list = new LevelDetail[](lvs.length);
-        for (uint i = 0; i < lvs.length; i++) {
-            list[i] = levelDetailOf(roundId_, lvs[i], user);
-        }
-    }
-
-    function _bossHpOf(uint256 roundId_, uint256 lv_) internal view returns (uint256) {
-        return rounds[roundId_].levels[lv_].hp;
-    }
-
-    function _bossEscapeTime() internal view returns (uint256) {
-        if (isPausing) return type(uint256).max;
-
-        if (pauseTime > boss.born_time) {
-            return boss.escape_time + _pauseDuration;
-        } else {
-            return boss.escape_time;
-        }
-    }
-
-    function _roundConfigOf(uint256 roundId_) internal view returns (Config storage) {
-        return rounds[roundId_].config;
-    }
-
     function _unfrozenLevelRewardAndClaimBulletToSystem() internal {
         uint256 _lastLv = rounds[roundId].lv;
-        Config storage _round_config = _roundConfigOf(roundId);
+        Config storage _round_config = rounds[roundId].config;
         for (uint i = 1; i <= _round_config.lock_lv; i++) {
             if (_lastLv > i) {
-                uint256 _lv = _lastLv - i;
-                uint256 _boss_hp = _bossHpOf(roundId, _lv);
+                uint256 _boss_hp = levels[roundId][_lastLv - i].hp;
                 // //unfrozen level reward
                 uint256 _lv_reward = (_boss_hp * _round_config.lv_reward_percent) / Constant.E4;
                 _reduceFrozenBullet(_lv_reward);
@@ -624,24 +448,19 @@ contract WorldBossGame is
     }
 
     function canClaimPrizeReward(address user) public view returns (bool) {
-        uint256 roundId_ = prizeRoundLevel[user].roundId;
-        uint256 lv_ = prizeRoundLevel[user].lv;
+        uint256 roundId_ = userPreRoundLevel[user].roundId;
 
         if (roundId == roundId_) return false;
-        if (rounds[roundId_].lv != lv_) return false;
 
         Round storage round = rounds[roundId_];
         if (round.prize_claimed[user] > 0) return false;
 
-        Level storage level = round.levels[lv_];
-        if (level.user_bullet[user] == 0) return false;
+        Level storage level = levels[roundId_][rounds[roundId_].lv];
+        if (level.user_bullet[user].attacked == 0) return false;
 
         return true;
     }
 
-    /**
-     * prize + user_bullet
-     */
     function userPrizeRewardOf(
         uint256 roundId_,
         address user
@@ -649,7 +468,7 @@ contract WorldBossGame is
         if (roundId_ == roundId) reward = 0;
         Round storage round = rounds[roundId_];
         address[] storage prize_users = round.prize_users;
-        uint256[] storage prize_config = round.prize_config;
+        uint32[] storage prize_config = round.prize_config;
         uint256 offset = prize_config.length - prize_users.length;
         for (uint256 i = 0; i < prize_users.length; i++) {
             if (user == prize_users[i]) {
@@ -657,24 +476,25 @@ contract WorldBossGame is
             }
         }
 
-        Level storage level = round.levels[round.lv];
-        reward += level.user_bullet[user];
+        Level storage level = levels[roundId_][round.lv];
+        reward += level.user_bullet[user].attacked;
     }
 
     function prizeWinnersOf(
         uint256 roundId_
-    ) public view returns (address[] memory users, uint256 prize) {
+    ) public view returns (address[] memory users, uint256 prize, uint32[] memory prize_config) {
         Round storage round = rounds[roundId_];
         address[] storage prize_users = round.prize_users;
         users = prize_users;
         prize = round.prize;
+        prize_config = round.prize_config;
     }
 
     function _leftPrizeRewardOf(uint256 roundId_) internal view returns (uint256 left) {
         require(roundId_ < roundId);
         Round storage round = rounds[roundId_];
         address[] storage prize_users = round.prize_users;
-        uint256[] storage prize_config = round.prize_config;
+        uint32[] storage prize_config = round.prize_config;
         uint256 length = prize_config.length - prize_users.length;
         uint256 _left_percent;
         for (uint256 i = 0; i < length; i++) {
@@ -683,24 +503,15 @@ contract WorldBossGame is
         left = (round.prize * _left_percent) / Constant.E4;
     }
 
-    /**
-     * Claim the prize and recover all bullets of the last level
-     */
-    function claimPrizeReward() public nonReentrant whenNotPaused onlyEOA {
-        require(canClaimPrizeReward(msg.sender), "Error");
-        _claimPrizeReward();
-    }
-
     function _claimPrizeReward() internal {
-        uint256 roundId_ = prizeRoundLevel[msg.sender].roundId;
-        Round storage round = rounds[roundId_];
+        uint256 roundId_ = userPreRoundLevel[msg.sender].roundId;
         uint256 _reward = userPrizeRewardOf(roundId_, msg.sender);
-        round.prize_claimed[msg.sender] = _reward;
+        rounds[roundId_].prize_claimed[msg.sender] = _reward;
         _addBullet(msg.sender, _reward);
         emit ClaimPrizeReward(msg.sender, roundId_, _reward);
     }
 
-    function increasePrize(uint256 amount) external payable nonReentrant whenNotPaused {
+    function increasePrize(uint256 amount) external payable nonReentrant whenGameNotPaused {
         require(roundId > 0, "game don't start");
         if (token == address(0)) {
             require(amount == msg.value, "invalid msg.value");
@@ -714,9 +525,7 @@ contract WorldBossGame is
 
     function _updatePrizeUser(uint256 bullet_) internal {
         Round storage round = rounds[roundId];
-        // Level storage level = round.levels[rounds[roundId].lv];
-        // if (level.total_bullet >= boss.hp) return;
-        if (block.timestamp + Constant.PRIZE_BLACK_TIME > _bossEscapeTime()) return;
+        if (block.timestamp + Constant.PRIZE_BLACK_TIME > boss.escape_time) return;
 
         if (bullet_ >= boss.hp / 100) {
             address[] storage prize_users = round.prize_users;
@@ -732,6 +541,11 @@ contract WorldBossGame is
         }
     }
 
+    function updateBornCD(uint64 born_cd_pre_attack_, uint64 born_cd_attack_) external onlyAdmin {
+        born_cd_pre_attack = born_cd_pre_attack_;
+        born_cd_attack = born_cd_attack_;
+    }
+
     function _beforeWithdraw() internal override {
         _autoClaim();
     }
@@ -740,14 +554,57 @@ contract WorldBossGame is
         uint256 roundId_,
         uint256 lv_,
         address user_
-    ) public view returns (uint256 total_bullet, uint256 user_bullet) {
-        total_bullet = rounds[roundId_].levels[lv_].total_bullet;
-        user_bullet = rounds[roundId_].levels[lv_].user_bullet[user_];
+    ) public view returns (uint256 total_bullet, uint256 user_bullet, uint256 boss_hp) {
+        total_bullet = levels[roundId_][lv_].total_bullet;
+        user_bullet = levels[roundId_][lv_].user_bullet[user_].attacked;
+        boss_hp = levels[roundId_][lv_].hp;
     }
 
     function theLastLevel() public view returns (uint256 roundId_, uint256 lv_) {
         roundId_ = roundId;
         lv_ = rounds[roundId].lv;
+    }
+
+    function onGameResume() internal virtual override {
+        boss.escape_time += uint64(unpauseTime - pauseTime);
+    }
+
+    function roundOf(
+        uint256 roundId_
+    )
+        external
+        view
+        returns (
+            uint256 _lv,
+            uint256 _prize,
+            Config memory _config,
+            uint32[] memory _prize_config,
+            address[] memory _prize_users
+        )
+    {
+        _lv = rounds[roundId_].lv;
+        _prize = rounds[roundId_].prize;
+        _config = rounds[roundId_].config;
+        _prize_config = rounds[roundId_].prize_config;
+        _prize_users = rounds[roundId_].prize_users;
+    }
+
+    function preRoundLevelOf(address user_) external view returns (uint256 _roundId, uint256 _lv) {
+        _roundId = userPreRoundLevel[user_].roundId;
+        _lv = userPreRoundLevel[user_].lv;
+    }
+
+    function killRewardRoundLevelsOf(
+        address user
+    ) external view returns (RoundLevel[] memory _lvs) {
+        _lvs = killRewardRoundLevels[user];
+    }
+
+    function attackedLvsOf(
+        uint256 roundId_,
+        address user
+    ) external view returns (uint256[] memory lvs) {
+        lvs = attacked_lvs[user][roundId_];
     }
 
     uint256[64] private __gap;
